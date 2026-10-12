@@ -1,0 +1,6 @@
+
+# Node/Playwright
+node_modules/
+.cache/
+tmp/
+/tmp/pw_*.png
