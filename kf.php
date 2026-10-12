@@ -3,17 +3,15 @@
  * kf.php - 无头浏览器视频直链提取 API
  *
  * 策略: PHP 接收参数 → 调用 Playwright Node.js 脚本 → 返回 JSON
- * 两种模式:
- *   iframe  - 访问公共解析源捕获 m3u8/mp4
- *   direct  - 直接访问视频站点抓真实请求
- *   all     - 两者都试 (默认)
+ *
+ * 环境要求:
+ *   - PHP 8.0+
+ *   - node + playwright + chromium
+ *   - 服务器不能禁用 proc_open/popen/exec 中至少一个
  *
  * 用法:
  *   kf.php?url=https://v.qq.com/x/page/xxx.html
  *   kf.php?url=xxx&mode=direct&timeout=25
- *   kf.php?url=xxx&mode=iframe
- *
- * 环境要求: node + playwright + chromium
  */
 
 header('Content-Type: application/json; charset=utf-8');
@@ -44,86 +42,147 @@ if (!filter_var($url, FILTER_VALIDATE_URL)) {
     exit;
 }
 
-// ============ 执行 Playwright 脚本 ============
+// ============ 环境诊断 ============
+$disabled = array_map('trim', explode(',', ini_get('disable_functions')));
+$disabled = array_filter($disabled);
+
+$canProcOpen = function_exists('proc_open') && !in_array('proc_open', $disabled);
+$canPopen    = function_exists('popen')    && !in_array('popen',    $disabled);
+$canExec     = function_exists('exec')     && !in_array('exec',     $disabled);
+$canSystem   = function_exists('system')   && !in_array('system',   $disabled);
+$canShellExec= function_exists('shell_exec') && !in_array('shell_exec', $disabled);
+
+// ============ 构建命令 ============
 $scriptPath = __DIR__ . '/scripts/kf.mjs';
-$nodeCmd    = 'cd ' . escapeshellarg(__DIR__) . ' && '
-            . 'node ' . escapeshellarg($scriptPath)
-            . ' --url='     . escapeshellarg($url)
-            . ' --mode='    . escapeshellarg($mode)
-            . ' --timeout=' . $timeout
-            . ' 2>&1'; // stderr 合并到 stdout
+$nodeCmd = 'cd ' . escapeshellarg(__DIR__) . ' && '
+         . 'node ' . escapeshellarg($scriptPath)
+         . ' --url='     . escapeshellarg($url)
+         . ' --mode='    . escapeshellarg($mode)
+         . ' --timeout=' . $timeout
+         . ' 2>&1';
 
 set_time_limit(120);
 
-// shell_exec 带超时 (PHP 8.2+)
-if (function_exists('proc_open')) {
-    // 用 proc_open 加超时
+$output = '';
+
+// ============ 方式 1: proc_open (支持超时, 最可靠) ============
+if ($canProcOpen) {
     $descriptorspec = [
         0 => ['pipe', 'r'],
         1 => ['pipe', 'w'],
         2 => ['pipe', 'w'],
     ];
     $proc = proc_open($nodeCmd, $descriptorspec, $pipes, __DIR__);
-    if (!is_resource($proc)) {
-        echo json_encode(['code' => 0, 'msg' => '无法启动 Playwright 进程']);
-        exit;
-    }
-    fclose($pipes[0]);
-
-    $output = '';
-    $start  = time();
-    while (true) {
-        $status = proc_get_status($proc);
-        if (!$status['running']) break;
-        if (time() - $start > 120) {
-            proc_terminate($proc);
-            break;
+    if (is_resource($proc)) {
+        fclose($pipes[0]);
+        stream_set_blocking($pipes[1], false);
+        $start = time();
+        while (true) {
+            $status = proc_get_status($proc);
+            if (!$status['running']) break;
+            if (time() - $start > 120) {
+                proc_terminate($proc);
+                break;
+            }
+            $chunk = stream_get_contents($pipes[1]);
+            if ($chunk !== false) $output .= $chunk;
+            usleep(200000);
         }
         $output .= stream_get_contents($pipes[1]);
-        usleep(200000);
+        proc_close($proc);
     }
-    $output .= stream_get_contents($pipes[1]);
-    proc_close($proc);
-} else {
-    $output = shell_exec($nodeCmd);
 }
 
-// ============ 解析输出 ============
-// Node 最后一段输出是完整 JSON (以 { 开头 })
-$output = trim($output);
-$jsonStart = strrpos($output, "\n{");
-if ($jsonStart === false) $jsonStart = strpos($output, '{');
-$lastJson = $jsonStart !== false ? substr($output, $jsonStart + ($jsonStart > 0 ? 1 : 0)) : '';
-
-// 也可能直接是 JSON
-if (empty($lastJson) && str_starts_with($output, '{')) {
-    $lastJson = $output;
+// ============ 方式 2: popen (管道模式, 第二可靠) ============
+if (empty($output) && $canPopen) {
+    $fp = popen($nodeCmd, 'r');
+    if ($fp !== false) {
+        $start = time();
+        stream_set_blocking($fp, false);
+        while (!feof($fp)) {
+            if (time() - $start > 120) break;
+            $chunk = fread($fp, 8192);
+            if ($chunk !== false && $chunk !== '') $output .= $chunk;
+            else usleep(200000);
+        }
+        $output .= stream_get_contents($fp);
+        pclose($fp);
+    }
 }
 
-if (empty($lastJson)) {
+// ============ 方式 3: exec (同步, 有输出数组) ============
+if (empty($output) && $canExec) {
+    exec($nodeCmd, $lines, $returnVar);
+    if (!empty($lines)) {
+        $output = implode("\n", $lines);
+    }
+}
+
+// ============ 方式 4: system (同步, 直接输出) ============
+if (empty($output) && $canSystem) {
+    ob_start();
+    system($nodeCmd);
+    $output = ob_get_clean();
+}
+
+// ============ 都不行 ============
+if (empty($output)) {
     echo json_encode([
         'code' => 0,
-        'msg'  => 'Playwright 无有效 JSON 输出',
-        'raw'  => substr($output, 0, 800),
-    ], JSON_UNESCAPED_UNICODE);
+        'msg'  => '服务器禁用了进程执行函数',
+        'detail' => [
+            'proc_open'  => $canProcOpen  ? '可用' : '禁用',
+            'popen'      => $canPopen     ? '可用' : '禁用',
+            'exec'       => $canExec      ? '可用' : '禁用',
+            'system'     => $canSystem    ? '可用' : '禁用',
+            'shell_exec' => $canShellExec ? '可用' : '禁用',
+            'disable_functions' => $disabled,
+        ],
+        'solution' => '宝塔面板 → 软件商店 → PHP → 设置 → 禁用函数 → 删除 proc_open,popen,exec',
+    ], JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT);
     exit;
 }
 
-$result = json_decode($lastJson, true);
-if (!$result) {
+// ============ 解析输出 (取最后的完整 JSON) ============
+$output = trim($output);
+
+// 找最后一个完整 JSON 对象 (从最后一个 { 开始匹配)
+$lastBrace = strrpos($output, '{');
+if ($lastBrace !== false) {
+    $jsonText = substr($output, $lastBrace);
+    $result = json_decode($jsonText, true);
+    if ($result === null) {
+        // 尝试逐步截断找有效 JSON
+        for ($i = strlen($jsonText) - 1; $i > 0; $i--) {
+            $sub = substr($jsonText, 0, $i);
+            $test = json_decode($sub, true);
+            if ($test !== null) {
+                $result = $test;
+                break;
+            }
+        }
+    }
+}
+
+if (!isset($result) || !$result) {
     echo json_encode([
         'code' => 0,
-        'msg'  => 'JSON 解析失败',
-        'raw'  => substr($lastJson, 0, 500),
-    ], JSON_UNESCAPED_UNICODE);
+        'msg'  => 'Playwright 无有效 JSON 输出',
+        'raw'  => substr($output, -800),
+        'funcs' => [
+            'proc_open' => $canProcOpen ? 'OK' : 'OFF',
+            'popen'     => $canPopen    ? 'OK' : 'OFF',
+            'exec'      => $canExec     ? 'OK' : 'OFF',
+        ],
+    ], JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT);
     exit;
 }
 
 // 附加 PHP 侧信息
 $result['_php'] = [
-    'version'  => PHP_VERSION,
-    'mode'     => $mode,
-    'timeout'  => $timeout,
+    'version' => PHP_VERSION,
+    'mode'    => $mode,
+    'timeout' => $timeout,
 ];
 
 echo json_encode($result, JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT);
